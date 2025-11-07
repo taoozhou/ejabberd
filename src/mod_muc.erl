@@ -24,7 +24,7 @@
 %%%----------------------------------------------------------------------
 -module(mod_muc).
 -author('alexey@process-one.net').
--protocol({xep, 45, '1.25', '0.5.0', "complete", ""}).
+-protocol({xep, 45, '1.35.2', '0.5.0', "complete", ""}).
 -protocol({xep, 249, '1.2', '0.5.0', "complete", ""}).
 -protocol({xep, 486, '0.1.0', '24.07', "complete", ""}).
 -ifndef(GEN_SERVER).
@@ -742,7 +742,8 @@ process_disco_info(#iq{type = get, from = From, to = To, lang = Lang,
 			   deny -> []
 		       end,
     Features = [?NS_DISCO_INFO, ?NS_DISCO_ITEMS,
-		?NS_MUC, ?NS_VCARD, ?NS_MUCSUB, ?NS_MUC_UNIQUE
+		?NS_MUC, ?NS_VCARD, ?NS_MUCSUB, ?NS_MUC_UNIQUE,
+		?NS_MUC_STABLE_ID
 		| RegisterFeatures ++ RSMFeatures ++ MAMFeatures ++ OccupantIdFeatures],
     Name = mod_muc_opt:name(ServerHost),
     Identity = #identity{category = <<"conference">>,
@@ -1141,14 +1142,37 @@ iq_get_register_info(ServerHost, Host, From, Lang) ->
 	      xdata = X}.
 
 set_nick(ServerHost, Host, From, Nick) ->
-    LServer = jid:nameprep(ServerHost),
-    Mod = gen_mod:db_mod(LServer, ?MODULE),
-    Mod:set_nick(LServer, Host, From, Nick).
+    case ejabberd_hooks:run_fold(registering_nickmuc,
+                                 ServerHost,
+                                 true,
+                                 [ServerHost, Host, From, Nick]) of
+        false ->
+            {atomic, false};
+        true ->
+            LServer = jid:nameprep(ServerHost),
+            Mod = gen_mod:db_mod(LServer, ?MODULE),
+            Mod:set_nick(LServer, Host, From, Nick)
+    end.
+
+set_nick(ServerHost, From, Nick) ->
+    lists:foreach(
+      fun(MucHost) ->
+              set_nick(ServerHost, MucHost, From, Nick)
+      end,
+      gen_mod:get_module_opt_hosts(ServerHost, mod_muc)).
 
 iq_set_register_info(ServerHost, Host, From, Nick,
 		     Lang) ->
+    OldNick = case mod_muc:get_register_nick(ServerHost, Host, From) of
+        error -> <<"">>;
+        ON when is_binary(ON) -> ON
+    end,
     case set_nick(ServerHost, Host, From, Nick) of
-      {atomic, ok} -> {result, undefined};
+      {atomic, ok} ->
+            ejabberd_hooks:run(registered_nickmuc,
+                                 ServerHost,
+                                 [ServerHost, Host, From, Nick, OldNick]),
+            {result, undefined};
       {atomic, false} ->
 	  ErrText = ?T("That nickname is registered by another person"),
 	  {error, xmpp:err_conflict(ErrText, Lang)};
@@ -1219,6 +1243,11 @@ remove_user(User, Server) ->
             ok
     end,
     JID = jid:make(User, Server),
+    lists:foreach(
+      fun(HostI) ->
+              set_nick(HostI, JID, <<"">>)
+      end,
+      ejabberd_option:hosts()),
     lists:foreach(
       fun(Host) ->
               lists:foreach(
